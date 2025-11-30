@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Google / YouTube / Gemini 全域名 WARP 分流一键脚本（Debian 优化） ==="
+echo "=== Google / YouTube / Gemini 全域名 WARP 分流一键脚本（Debian 优化·加强版） ==="
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行：sudo bash warp-google.sh"
@@ -47,7 +47,7 @@ case "$PKG_MANAGER" in
     ;;
 esac
 
-# ---- 2. 安装 wgcf，生成 WARP WireGuard 配置 ----
+# ---- 2. 安装 wgcf，生成 / 复用 WARP WireGuard 配置 ----
 if ! command -v wgcf >/dev/null 2>&1; then
   echo "[*] 安装 wgcf..."
   WGCF_VER="2.2.18"
@@ -68,23 +68,51 @@ fi
 mkdir -p /etc/wireguard
 cd /etc/wireguard
 
-if [[ ! -f wgcf-account.toml ]]; then
-  echo "[*] 注册 WARP 账户（wgcf）..."
+# --- 2.1 注册 WARP 账户（带重试），如已有有效账号则跳过 ---
+if [[ -f wgcf-account.toml && -s wgcf-account.toml ]]; then
+  echo "[*] 检测到已有 wgcf-account.toml，跳过 register。"
+else
+  echo "[*] 未检测到 wgcf-account.toml，开始注册 WARP 账户..."
   export WGCF_ACCEPT_TOS=1
-  wgcf register --accept-tos || true
+
+  RETRY=0
+  MAX_RETRY=5
+  while (( RETRY < MAX_RETRY )); do
+    if wgcf register --accept-tos; then
+      echo "[*] WARP 账户注册成功。"
+      break
+    else
+      RETRY=$((RETRY+1))
+      echo "[!] wgcf register 失败（第 ${RETRY} 次），稍后重试..."
+      sleep 5
+    fi
+  done
+
+  if (( RETRY >= MAX_RETRY )); then
+    echo "[x] 多次尝试 wgcf register 仍失败，请稍后再试或检查网络。"
+    exit 1
+  fi
 fi
 
-echo "[*] 生成 WARP 配置 wgcf-profile.conf ..."
-wgcf generate -f wgcf-profile.conf
+# --- 2.2 生成 / 复用 wgcf-profile.conf ---
+if [[ -f wgcf-profile.conf && -s wgcf-profile.conf ]]; then
+  echo "[*] 检测到已有 wgcf-profile.conf，复用该配置。"
+else
+  echo "[*] 生成 WARP WireGuard 配置 wgcf-profile.conf ..."
+  if ! wgcf generate -p wgcf-profile.conf; then
+    echo "[x] wgcf generate 失败，请检查 wgcf 或网络。"
+    exit 1
+  fi
+fi
 
-if [[ ! -f wgcf-profile.conf ]]; then
-  echo "生成 wgcf-profile.conf 失败，请检查 wgcf 输出。"
+PROFILE="/etc/wireguard/wgcf-profile.conf"
+
+if [[ ! -f "$PROFILE" ]]; then
+  echo "[x] 未找到 wgcf-profile.conf，无法继续。"
   exit 1
 fi
 
 # ---- 3. 从 wgcf-profile.conf 中提取 WireGuard 参数 ----
-PROFILE="/etc/wireguard/wgcf-profile.conf"
-
 WG_PRIVATE_KEY=$(grep -m1 '^PrivateKey' "$PROFILE" | awk '{print $3}')
 WG_PEER_PUBLIC_KEY=$(grep -m1 '^PublicKey' "$PROFILE" | awk '{print $3}')
 WG_ENDPOINT=$(grep -m1 '^Endpoint' "$PROFILE" | awk '{print $3}')
@@ -94,7 +122,19 @@ WG_ADDR_V4=$(echo "$ADDR_LINE" | grep -oE '([0-9]+\.){3}[0-9]+/[0-9]+' || true)
 WG_ADDR_V6=$(echo "$ADDR_LINE" | grep -oE '([0-9a-fA-F:]+)/[0-9]+' || true)
 
 if [[ -z "$WG_PRIVATE_KEY" || -z "$WG_PEER_PUBLIC_KEY" || -z "$WG_ENDPOINT" ]]; then
-  echo "从 wgcf-profile.conf 中提取 WARP 参数失败。"
+  echo "[x] 从 wgcf-profile.conf 中提取 WARP 参数失败。"
+  exit 1
+fi
+
+# 组装 local_address 数组（可能只有 v4 或只有 v6）
+if [[ -n "$WG_ADDR_V4" && -n "$WG_ADDR_V6" ]]; then
+  LOCAL_ADDRS="\"$WG_ADDR_V4\", \"$WG_ADDR_V6\""
+elif [[ -n "$WG_ADDR_V4" ]]; then
+  LOCAL_ADDRS="\"$WG_ADDR_V4\""
+elif [[ -n "$WG_ADDR_V6" ]]; then
+  LOCAL_ADDRS="\"$WG_ADDR_V6\""
+else
+  echo "[x] 未在 wgcf-profile.conf 中找到任何 Address（v4/v6），无法继续。"
   exit 1
 fi
 
@@ -188,8 +228,7 @@ cat > "$CONFIG_PATH" <<EOF
       "server": "$(echo "$WG_ENDPOINT" | cut -d: -f1)",
       "server_port": $(echo "$WG_ENDPOINT" | cut -d: -f2),
       "local_address": [
-        "$WG_ADDR_V4",
-        "$WG_ADDR_V6"
+        $LOCAL_ADDRS
       ],
       "private_key": "$WG_PRIVATE_KEY",
       "peer_public_key": "$WG_PEER_PUBLIC_KEY",
@@ -254,7 +293,7 @@ cat > "$TPROXY_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -e
 
-# 清空旧规则
+# 清空旧规则（仅 mangle 表）
 iptables -t mangle -F
 iptables -t mangle -X SINGBOX 2>/dev/null || true
 
@@ -288,7 +327,7 @@ iptables -t mangle -A PREROUTING -p udp -j SINGBOX
 ip6tables -t mangle -A PREROUTING -p tcp -j SINGBOX
 ip6tables -t mangle -A PREROUTING -p udp -j SINGBOX
 
-# ip rule + route，确保 1 mark 流量回到本机
+# ip rule + route，确保带 mark=1 的流量回到本机（透明代理）
 ip rule del fwmark 1 lookup 100 2>/dev/null || true
 ip -6 rule del fwmark 1 lookup 100 2>/dev/null || true
 ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
@@ -327,11 +366,10 @@ systemctl daemon-reload
 
 echo "[*] 启用并启动 sing-box 与 TProxy 服务..."
 
-# 某些安装脚本创建的服务名是 sing-box.service
+# 如果安装脚本已经创建了 sing-box.service，就直接用；否则创建一个
 if systemctl list-unit-files | grep -q '^sing-box.service'; then
   systemctl enable --now sing-box.service
 else
-  # 兜底：创建一个简单的 sing-box systemd 服务
   cat > /etc/systemd/system/sing-box.service <<EOT
 [Unit]
 Description=sing-box proxy service
