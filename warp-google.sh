@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Google / YouTube / Gemini 全域名 WARP 分流一键脚本（Debian 优化·加强版） ==="
+echo "=== Google / YouTube / Gemini 全域名 WARP 分流一键脚本（Debian 优化·最终版） ==="
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行：sudo bash warp-google.sh"
   exit 1
 fi
 
-# ---- 1. 检测包管理器并安装依赖 ----
+########################################
+# 1. 检测包管理器并安装依赖
+########################################
+
 detect_pkg() {
   if command -v apt >/dev/null 2>&1; then
     echo apt
@@ -47,7 +50,10 @@ case "$PKG_MANAGER" in
     ;;
 esac
 
-# ---- 2. 安装 wgcf，生成 / 复用 WARP WireGuard 配置 ----
+########################################
+# 2. 安装 wgcf，生成 / 复用 WARP WireGuard 配置
+########################################
+
 if ! command -v wgcf >/dev/null 2>&1; then
   echo "[*] 安装 wgcf..."
   WGCF_VER="2.2.18"
@@ -68,7 +74,7 @@ fi
 mkdir -p /etc/wireguard
 cd /etc/wireguard
 
-# --- 2.1 注册 WARP 账户（带重试），如已有有效账号则跳过 ---
+# 2.1 注册 WARP 账户（带重试），如已有有效账号则跳过
 if [[ -f wgcf-account.toml && -s wgcf-account.toml ]]; then
   echo "[*] 检测到已有 wgcf-account.toml，跳过 register。"
 else
@@ -94,7 +100,7 @@ else
   fi
 fi
 
-# --- 2.2 生成 / 复用 wgcf-profile.conf ---
+# 2.2 生成 / 复用 wgcf-profile.conf
 if [[ -f wgcf-profile.conf && -s wgcf-profile.conf ]]; then
   echo "[*] 检测到已有 wgcf-profile.conf，复用该配置。"
 else
@@ -112,14 +118,30 @@ if [[ ! -f "$PROFILE" ]]; then
   exit 1
 fi
 
-# ---- 3. 从 wgcf-profile.conf 中提取 WireGuard 参数 ----
+########################################
+# 3. 从 wgcf-profile.conf 中提取 WireGuard 参数
+########################################
+
 WG_PRIVATE_KEY=$(grep -m1 '^PrivateKey' "$PROFILE" | awk '{print $3}')
 WG_PEER_PUBLIC_KEY=$(grep -m1 '^PublicKey' "$PROFILE" | awk '{print $3}')
 WG_ENDPOINT=$(grep -m1 '^Endpoint' "$PROFILE" | awk '{print $3}')
 ADDR_LINE=$(grep -m1 '^Address' "$PROFILE" | sed 's/Address *= *//')
 
-WG_ADDR_V4=$(echo "$ADDR_LINE" | grep -oE '([0-9]+\.){3}[0-9]+/[0-9]+' || true)
-WG_ADDR_V6=$(echo "$ADDR_LINE" | grep -oE '([0-9a-fA-F:]+)/[0-9]+' || true)
+WG_ADDR_V4=""
+WG_ADDR_V6=""
+
+# Address 一般类似：Address = 172.16.0.2/32, 2606:4700:xxxx::xxxx/128
+# 我们按逗号拆分，分别判断是 v4 还是 v6，避免之前正则错误匹配出 "2/32"
+IFS=',' read -ra ADDR_ARR <<< "$ADDR_LINE"
+for token in "${ADDR_ARR[@]}"; do
+  # 去掉前后空格和引号
+  token=$(echo "$token" | sed 's/^[ "]*//;s/[ "]*$//')
+  if [[ "$token" == *:* ]]; then
+    WG_ADDR_V6="$token"
+  elif [[ "$token" == *.* ]]; then
+    WG_ADDR_V4="$token"
+  fi
+done
 
 if [[ -z "$WG_PRIVATE_KEY" || -z "$WG_PEER_PUBLIC_KEY" || -z "$WG_ENDPOINT" ]]; then
   echo "[x] 从 wgcf-profile.conf 中提取 WARP 参数失败。"
@@ -142,16 +164,23 @@ echo "[*] WARP Endpoint: $WG_ENDPOINT"
 echo "[*] WARP IPv4: ${WG_ADDR_V4:-无}"
 echo "[*] WARP IPv6: ${WG_ADDR_V6:-无}"
 
-# ---- 4. 安装 sing-box ----
+########################################
+# 4. 安装 sing-box
+########################################
+
 if ! command -v sing-box >/dev/null 2>&1; then
   echo "[*] 安装 sing-box ..."
   curl -fsSL https://sing-box.app/install.sh | bash
 fi
 
-mkdir -p /usr/local/etc/sing-box
+CONFIG_DIR="/etc/sing-box"
+mkdir -p "$CONFIG_DIR"
 
-# ---- 5. 写入 sing-box 配置（TProxy + WARP + Google 全家桶分流） ----
-CONFIG_PATH="/usr/local/etc/sing-box/config.json"
+########################################
+# 5. 写入 sing-box 配置（TProxy + WARP + Google 全家桶分流）
+########################################
+
+CONFIG_PATH="$CONFIG_DIR/config.json"
 
 cat > "$CONFIG_PATH" <<EOF
 {
@@ -286,65 +315,75 @@ EOF
 
 echo "[*] sing-box 配置已写入：$CONFIG_PATH"
 
-# ---- 6. 配置 TProxy 防火墙规则脚本 ----
+########################################
+# 6. 配置 TProxy 防火墙规则脚本（稳健版）
+########################################
+
 TPROXY_SCRIPT="/usr/local/bin/singbox-tproxy.sh"
 
 cat > "$TPROXY_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -e
 
-# 清空旧规则（仅 mangle 表）
-iptables -t mangle -F
+# 只清理我们自己的链，避免影响其他 mangle 规则
+iptables -t mangle -F SINGBOX 2>/dev/null || true
+iptables -t mangle -D PREROUTING -p tcp -j SINGBOX 2>/dev/null || true
+iptables -t mangle -D PREROUTING -p udp -j SINGBOX 2>/dev/null || true
 iptables -t mangle -X SINGBOX 2>/dev/null || true
 
-ip6tables -t mangle -F
-ip6tables -t mangle -X SINGBOX 2>/dev/null || true
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t mangle -F SINGBOX 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -p tcp -j SINGBOX 2>/dev/null || true
+  ip6tables -t mangle -D PREROUTING -p udp -j SINGBOX 2>/dev/null || true
+  ip6tables -t mangle -X SINGBOX 2>/dev/null || true
+fi
 
-# 新建链
+# 新建链并接管 TCP/UDP 流量（IPv4）
 iptables -t mangle -N SINGBOX
-ip6tables -t mangle -N SINGBOX
-
 # 不处理本地回环
 iptables -t mangle -A SINGBOX -d 127.0.0.1/32 -j RETURN
-ip6tables -t mangle -A SINGBOX -d ::1/128 -j RETURN
-
-# 可选：不处理局域网，如果是纯 VPS 通常没有
-# iptables -t mangle -A SINGBOX -d 10.0.0.0/8 -j RETURN
-# iptables -t mangle -A SINGBOX -d 192.168.0.0/16 -j RETURN
-# iptables -t mangle -A SINGBOX -d 172.16.0.0/12 -j RETURN
-
 # 将 TCP/UDP 导入 TProxy
 iptables -t mangle -A SINGBOX -p tcp -j TPROXY --on-port 60080 --tproxy-mark 1
 iptables -t mangle -A SINGBOX -p udp -j TPROXY --on-port 60080 --tproxy-mark 1
-
-ip6tables -t mangle -A SINGBOX -p tcp -j TPROXY --on-port 60080 --tproxy-mark 1
-ip6tables -t mangle -A SINGBOX -p udp -j TPROXY --on-port 60080 --tproxy-mark 1
-
 # PREROUTING 引流
 iptables -t mangle -A PREROUTING -p tcp -j SINGBOX
 iptables -t mangle -A PREROUTING -p udp -j SINGBOX
 
-ip6tables -t mangle -A PREROUTING -p tcp -j SINGBOX
-ip6tables -t mangle -A PREROUTING -p udp -j SINGBOX
+# IPv6 部分是可选的，如果系统不支持 IPv6 或没开启，相关错误会被忽略
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t mangle -N SINGBOX
+  ip6tables -t mangle -A SINGBOX -d ::1/128 -j RETURN
+  ip6tables -t mangle -A SINGBOX -p tcp -j TPROXY --on-port 60080 --tproxy-mark 1
+  ip6tables -t mangle -A SINGBOX -p udp -j TPROXY --on-port 60080 --tproxy-mark 1
+  ip6tables -t mangle -A PREROUTING -p tcp -j SINGBOX
+  ip6tables -t mangle -A PREROUTING -p udp -j SINGBOX
+fi
 
-# ip rule + route，确保带 mark=1 的流量回到本机（透明代理）
+# ip rule + route，确保 mark=1 的流量回到本机（透明代理）
+
+# 先删旧的，忽略错误
 ip rule del fwmark 1 lookup 100 2>/dev/null || true
 ip -6 rule del fwmark 1 lookup 100 2>/dev/null || true
 ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
 
-ip rule add fwmark 1 lookup 100
-ip -6 rule add fwmark 1 lookup 100
+# 再加新的，忽略 "File exists" 等错误
+ip rule add fwmark 1 lookup 100 2>/dev/null || true
+ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
 
-ip route add local 0.0.0.0/0 dev lo table 100
-ip -6 route add local ::/0 dev lo table 100
+# IPv6 路由是可选的，系统没开 IPv6 也无所谓
+ip -6 rule add fwmark 1 lookup 100 2>/dev/null || true
+ip -6 route add local ::/0 dev lo table 100 2>/dev/null || true
 
 echo "TProxy 防火墙规则已应用。"
 EOF
 
 chmod +x "$TPROXY_SCRIPT"
 
-# ---- 7. systemd 服务：firewall + sing-box ----
+########################################
+# 7. systemd 服务：TProxy + sing-box
+########################################
+
 TPROXY_SERVICE="/etc/systemd/system/singbox-tproxy.service"
 
 cat > "$TPROXY_SERVICE" <<EOF
@@ -366,10 +405,11 @@ systemctl daemon-reload
 
 echo "[*] 启用并启动 sing-box 与 TProxy 服务..."
 
-# 如果安装脚本已经创建了 sing-box.service，就直接用；否则创建一个
+# 使用安装包自带的 sing-box.service（Debian .deb 安装会提供）
 if systemctl list-unit-files | grep -q '^sing-box.service'; then
   systemctl enable --now sing-box.service
 else
+  # 兜底：如果没有自带 service，则创建一个简单的
   cat > /etc/systemd/system/sing-box.service <<EOT
 [Unit]
 Description=sing-box proxy service
@@ -377,7 +417,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json
+ExecStart=$(command -v sing-box) run -c $CONFIG_PATH
 Restart=on-failure
 RestartSec=5
 
