@@ -1,437 +1,231 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
+# ===================================================
+# Project: WARP Google Unlock (System Level)
+# Version: 3.0 (Final Stable)
+# Description: KVM/LXC/OpenVZ compatible, Duplicate-proof
+# ===================================================
 
-echo "=== Google / YouTube / Gemini 全域名 WARP 分流一键脚本（Debian 优化·最终版） ==="
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+SKYBLUE='\033[0;36m'
+NC='\033[0m'
 
-if [[ $EUID -ne 0 ]]; then
-  echo "请用 root 运行：sudo bash warp-google.sh"
-  exit 1
-fi
+# ===================================================
+# 0. 环境预检 (新增)
+# ===================================================
+check_env() {
+    # Root 检查
+    [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行！${NC}" && exit 1
 
-########################################
-# 1. 检测包管理器并安装依赖
-########################################
-
-detect_pkg() {
-  if command -v apt >/dev/null 2>&1; then
-    echo apt
-  elif command -v apt-get >/dev/null 2>&1; then
-    echo apt-get
-  elif command -v yum >/dev/null 2>&1; then
-    echo yum
-  elif command -v dnf >/dev/null 2>&1; then
-    echo dnf
-  elif command -v pacman >/dev/null 2>&1; then
-    echo pacman
-  else
-    echo ""
-  fi
-}
-
-PKG_MANAGER=$(detect_pkg)
-
-if [[ -z "$PKG_MANAGER" ]]; then
-  echo "无法识别包管理器，请手动安装：curl wget iptables iproute2 jq"
-  exit 1
-fi
-
-echo "[*] 使用包管理器：$PKG_MANAGER 安装依赖..."
-
-case "$PKG_MANAGER" in
-  apt|apt-get)
-    $PKG_MANAGER update -y
-    $PKG_MANAGER install -y curl wget iptables iproute2 jq
-    ;;
-  yum|dnf)
-    $PKG_MANAGER install -y curl wget iptables iproute jq
-    ;;
-  pacman)
-    pacman -Sy --noconfirm curl wget iptables iproute2 jq
-    ;;
-esac
-
-########################################
-# 2. 安装 wgcf，生成 / 复用 WARP WireGuard 配置
-########################################
-
-if ! command -v wgcf >/dev/null 2>&1; then
-  echo "[*] 安装 wgcf..."
-  WGCF_VER="2.2.18"
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64|amd64) WG_ARCH=amd64 ;;
-    aarch64|arm64) WG_ARCH=arm64 ;;
-    *)
-      echo "暂不支持当前架构：$ARCH，需要手动安装 wgcf。"
-      exit 1
-      ;;
-  esac
-
-  wget -O /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/wgcf_${WGCF_VER}_linux_${WG_ARCH}"
-  chmod +x /usr/local/bin/wgcf
-fi
-
-mkdir -p /etc/wireguard
-cd /etc/wireguard
-
-# 2.1 注册 WARP 账户（带重试），如已有有效账号则跳过
-if [[ -f wgcf-account.toml && -s wgcf-account.toml ]]; then
-  echo "[*] 检测到已有 wgcf-account.toml，跳过 register。"
-else
-  echo "[*] 未检测到 wgcf-account.toml，开始注册 WARP 账户..."
-  export WGCF_ACCEPT_TOS=1
-
-  RETRY=0
-  MAX_RETRY=5
-  while (( RETRY < MAX_RETRY )); do
-    if wgcf register --accept-tos; then
-      echo "[*] WARP 账户注册成功。"
-      break
-    else
-      RETRY=$((RETRY+1))
-      echo "[!] wgcf register 失败（第 ${RETRY} 次），稍后重试..."
-      sleep 5
+    # TUN/TAP 检查 (针对 OpenVZ/LXC)
+    if [ ! -e /dev/net/tun ]; then
+        echo -e "${RED}❌ 致命错误：未检测到 TUN 设备！${NC}"
+        echo -e "${YELLOW}请在 VPS 控制面板开启 TUN/TAP 功能，或联系服务商。${NC}"
+        exit 1
     fi
-  done
-
-  if (( RETRY >= MAX_RETRY )); then
-    echo "[x] 多次尝试 wgcf register 仍失败，请稍后再试或检查网络。"
-    exit 1
-  fi
-fi
-
-# 2.2 生成 / 复用 wgcf-profile.conf
-if [[ -f wgcf-profile.conf && -s wgcf-profile.conf ]]; then
-  echo "[*] 检测到已有 wgcf-profile.conf，复用该配置。"
-else
-  echo "[*] 生成 WARP WireGuard 配置 wgcf-profile.conf ..."
-  if ! wgcf generate -p wgcf-profile.conf; then
-    echo "[x] wgcf generate 失败，请检查 wgcf 或网络。"
-    exit 1
-  fi
-fi
-
-PROFILE="/etc/wireguard/wgcf-profile.conf"
-
-if [[ ! -f "$PROFILE" ]]; then
-  echo "[x] 未找到 wgcf-profile.conf，无法继续。"
-  exit 1
-fi
-
-########################################
-# 3. 从 wgcf-profile.conf 中提取 WireGuard 参数
-########################################
-
-WG_PRIVATE_KEY=$(grep -m1 '^PrivateKey' "$PROFILE" | awk '{print $3}')
-WG_PEER_PUBLIC_KEY=$(grep -m1 '^PublicKey' "$PROFILE" | awk '{print $3}')
-WG_ENDPOINT=$(grep -m1 '^Endpoint' "$PROFILE" | awk '{print $3}')
-ADDR_LINE=$(grep -m1 '^Address' "$PROFILE" | sed 's/Address *= *//')
-
-WG_ADDR_V4=""
-WG_ADDR_V6=""
-
-# Address 一般类似：Address = 172.16.0.2/32, 2606:4700:xxxx::xxxx/128
-# 我们按逗号拆分，分别判断是 v4 还是 v6，避免之前正则错误匹配出 "2/32"
-IFS=',' read -ra ADDR_ARR <<< "$ADDR_LINE"
-for token in "${ADDR_ARR[@]}"; do
-  # 去掉前后空格和引号
-  token=$(echo "$token" | sed 's/^[ "]*//;s/[ "]*$//')
-  if [[ "$token" == *:* ]]; then
-    WG_ADDR_V6="$token"
-  elif [[ "$token" == *.* ]]; then
-    WG_ADDR_V4="$token"
-  fi
-done
-
-if [[ -z "$WG_PRIVATE_KEY" || -z "$WG_PEER_PUBLIC_KEY" || -z "$WG_ENDPOINT" ]]; then
-  echo "[x] 从 wgcf-profile.conf 中提取 WARP 参数失败。"
-  exit 1
-fi
-
-# 组装 local_address 数组（可能只有 v4 或只有 v6）
-if [[ -n "$WG_ADDR_V4" && -n "$WG_ADDR_V6" ]]; then
-  LOCAL_ADDRS="\"$WG_ADDR_V4\", \"$WG_ADDR_V6\""
-elif [[ -n "$WG_ADDR_V4" ]]; then
-  LOCAL_ADDRS="\"$WG_ADDR_V4\""
-elif [[ -n "$WG_ADDR_V6" ]]; then
-  LOCAL_ADDRS="\"$WG_ADDR_V6\""
-else
-  echo "[x] 未在 wgcf-profile.conf 中找到任何 Address（v4/v6），无法继续。"
-  exit 1
-fi
-
-echo "[*] WARP Endpoint: $WG_ENDPOINT"
-echo "[*] WARP IPv4: ${WG_ADDR_V4:-无}"
-echo "[*] WARP IPv6: ${WG_ADDR_V6:-无}"
-
-########################################
-# 4. 安装 sing-box
-########################################
-
-if ! command -v sing-box >/dev/null 2>&1; then
-  echo "[*] 安装 sing-box ..."
-  curl -fsSL https://sing-box.app/install.sh | bash
-fi
-
-CONFIG_DIR="/etc/sing-box"
-mkdir -p "$CONFIG_DIR"
-
-########################################
-# 5. 写入 sing-box 配置（TProxy + WARP + Google 全家桶分流）
-########################################
-
-CONFIG_PATH="$CONFIG_DIR/config.json"
-
-cat > "$CONFIG_PATH" <<EOF
-{
-  "log": {
-    "level": "info",
-    "output": "stderr"
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "google-dns",
-        "address": "8.8.8.8",
-        "address_resolver": "local"
-      },
-      {
-        "tag": "local",
-        "address": "system"
-      }
-    ],
-    "rules": [
-      {
-        "domain_suffix": [
-          "google.com",
-          "google.cn",
-          "gstatic.com",
-          "ggpht.com",
-          "googleapis.com",
-          "googleusercontent.com",
-          "googlevideo.com",
-          "gvt1.com",
-          "gvt2.com",
-          "withgoogle.com",
-          "android.com",
-          "youtube.com",
-          "ytimg.com",
-          "youtu.be",
-          "youtube-nocookie.com",
-          "yt.be",
-          "gemini.google.com",
-          "deepmind.com",
-          "chrome.com",
-          "chromium.org",
-          "g.co",
-          "goo.gl",
-          "gmail.com",
-          "drive.google.com",
-          "docs.google.com",
-          "meet.google.com",
-          "hangouts.google.com",
-          "play.google.com",
-          "firebaseio.com",
-          "snap.googleapis.com"
-        ],
-        "server": "google-dns"
-      }
-    ],
-    "final": "local"
-  },
-  "inbounds": [
-    {
-      "type": "tproxy",
-      "tag": "tproxy-in",
-      "listen": "::",
-      "listen_port": 60080,
-      "network": "tcp,udp",
-      "sniff": true,
-      "sniff_override_destination": true
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "wireguard",
-      "tag": "warp",
-      "server": "$(echo "$WG_ENDPOINT" | cut -d: -f1)",
-      "server_port": $(echo "$WG_ENDPOINT" | cut -d: -f2),
-      "local_address": [
-        $LOCAL_ADDRS
-      ],
-      "private_key": "$WG_PRIVATE_KEY",
-      "peer_public_key": "$WG_PEER_PUBLIC_KEY",
-      "reserved": [1, 2, 3],
-      "mtu": 1280
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "domain_suffix": [
-          "google.com",
-          "google.cn",
-          "gstatic.com",
-          "ggpht.com",
-          "googleapis.com",
-          "googleusercontent.com",
-          "googlevideo.com",
-          "gvt1.com",
-          "gvt2.com",
-          "withgoogle.com",
-          "android.com",
-          "youtube.com",
-          "ytimg.com",
-          "youtu.be",
-          "youtube-nocookie.com",
-          "yt.be",
-          "gemini.google.com",
-          "deepmind.com",
-          "chrome.com",
-          "chromium.org",
-          "g.co",
-          "goo.gl",
-          "gmail.com",
-          "drive.google.com",
-          "docs.google.com",
-          "meet.google.com",
-          "hangouts.google.com",
-          "play.google.com",
-          "firebaseio.com",
-          "snap.googleapis.com"
-        ],
-        "outbound": "warp"
-      }
-    ],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
 }
-EOF
 
-echo "[*] sing-box 配置已写入：$CONFIG_PATH"
+# ===================================================
+# 1. 安装逻辑
+# ===================================================
+install_warp() {
+    check_env
+    echo -e "${YELLOW}>>> [1/5] 安装依赖...${NC}"
+    
+    # 安装工具
+    if [ -f /etc/debian_version ]; then
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y wireguard-tools curl wget git lsb-release ufw >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y wireguard-tools curl wget git >/dev/null 2>&1
+    fi
 
-########################################
-# 6. 配置 TProxy 防火墙规则脚本（稳健版）
-########################################
+    # 开启转发
+    if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+        echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
+        sysctl -p >/dev/null 2>&1
+    fi
 
-TPROXY_SCRIPT="/usr/local/bin/singbox-tproxy.sh"
+    echo -e "${YELLOW}>>> [2/5] 注册 WARP 账号...${NC}"
+    mkdir -p /etc/wireguard/warp_tmp
+    cd /etc/wireguard/warp_tmp || exit
 
-cat > "$TPROXY_SCRIPT" <<'EOF'
-#!/usr/bin/env bash
-set -e
+    # 下载 wgcf
+    ARCH=$(uname -m)
+    if [[ $ARCH == "x86_64" ]]; then
+        WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64"
+    elif [[ $ARCH == "aarch64" ]]; then
+        WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_arm64"
+    else
+        echo -e "${RED}不支持的架构: $ARCH${NC}" && exit 1
+    fi
 
-# 只清理我们自己的链，避免影响其他 mangle 规则
-iptables -t mangle -F SINGBOX 2>/dev/null || true
-iptables -t mangle -D PREROUTING -p tcp -j SINGBOX 2>/dev/null || true
-iptables -t mangle -D PREROUTING -p udp -j SINGBOX 2>/dev/null || true
-iptables -t mangle -X SINGBOX 2>/dev/null || true
+    wget -qO /usr/local/bin/wgcf $WGCF_URL
+    chmod +x /usr/local/bin/wgcf
 
-if command -v ip6tables >/dev/null 2>&1; then
-  ip6tables -t mangle -F SINGBOX 2>/dev/null || true
-  ip6tables -t mangle -D PREROUTING -p tcp -j SINGBOX 2>/dev/null || true
-  ip6tables -t mangle -D PREROUTING -p udp -j SINGBOX 2>/dev/null || true
-  ip6tables -t mangle -X SINGBOX 2>/dev/null || true
+    # 注册 (防止重复注册报错)
+    if [ ! -f wgcf-account.toml ]; then
+        echo | /usr/local/bin/wgcf register >/dev/null 2>&1
+    fi
+    /usr/local/bin/wgcf generate >/dev/null 2>&1
+
+    # 检查是否成功生成
+    if [ ! -f wgcf-profile.conf ]; then
+        echo -e "${RED}❌ WARP 配置文件生成失败！可能是接口被限制，请稍后再试。${NC}"
+        rm -rf /etc/wireguard/warp_tmp
+        exit 1
+    fi
+
+    echo -e "${YELLOW}>>> [3/5] 优化配置 (防断连/DNS优化)...${NC}"
+    CONF_PATH="/etc/wireguard/warp.conf"
+    cp wgcf-profile.conf $CONF_PATH
+
+    # --- 配置修改 (幂等性检查，防止重复添加) ---
+    
+    # 1. 强制 DNS (避免污染)
+    sed -i '/DNS/d' $CONF_PATH
+    sed -i '/\[Interface\]/a DNS = 8.8.8.8, 1.1.1.1' $CONF_PATH
+
+    # 2. 禁止接管全流量
+    sed -i '/Table/d' $CONF_PATH
+    sed -i '/\[Interface\]/a Table = off' $CONF_PATH
+
+    # 3. 永久保活 (25s)
+    sed -i '/PersistentKeepalive/d' $CONF_PATH
+    sed -i '/\[Peer\]/a PersistentKeepalive = 25' $CONF_PATH
+
+    # 4. 路由脚本钩子 (先删旧的再加新的，防止重复)
+    sed -i '/PostUp/d' $CONF_PATH
+    sed -i '/PreDown/d' $CONF_PATH
+    sed -i '/\[Interface\]/a PostUp = bash /etc/wireguard/add_google_routes.sh' $CONF_PATH
+    sed -i '/\[Interface\]/a PreDown = bash /etc/wireguard/del_google_routes.sh' $CONF_PATH
+
+    cd /root || exit
+    rm -rf /etc/wireguard/warp_tmp
+
+    echo -e "${YELLOW}>>> [4/5] 生成路由规则脚本...${NC}"
+    
+    # 写入添加路由脚本 (增加容错)
+    cat > /etc/wireguard/add_google_routes.sh << 'EOF'
+#!/bin/bash
+IP_LIST="/etc/wireguard/google_ips.txt"
+# 增加重试机制下载 IP 列表
+wget -T 10 -t 3 -qO $IP_LIST https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/google.txt
+
+# 如果下载失败，生成一个最小化的 Gemini IP 列表防止报错
+if [ ! -s $IP_LIST ]; then
+    echo "142.250.0.0/15" > $IP_LIST
+    echo "2001:4860::/32" >> $IP_LIST
 fi
 
-# 新建链并接管 TCP/UDP 流量（IPv4）
-iptables -t mangle -N SINGBOX
-# 不处理本地回环
-iptables -t mangle -A SINGBOX -d 127.0.0.1/32 -j RETURN
-# 将 TCP/UDP 导入 TProxy
-iptables -t mangle -A SINGBOX -p tcp -j TPROXY --on-port 60080 --tproxy-mark 1
-iptables -t mangle -A SINGBOX -p udp -j TPROXY --on-port 60080 --tproxy-mark 1
-# PREROUTING 引流
-iptables -t mangle -A PREROUTING -p tcp -j SINGBOX
-iptables -t mangle -A PREROUTING -p udp -j SINGBOX
-
-# IPv6 部分是可选的，如果系统不支持 IPv6 或没开启，相关错误会被忽略
-if command -v ip6tables >/dev/null 2>&1; then
-  ip6tables -t mangle -N SINGBOX
-  ip6tables -t mangle -A SINGBOX -d ::1/128 -j RETURN
-  ip6tables -t mangle -A SINGBOX -p tcp -j TPROXY --on-port 60080 --tproxy-mark 1
-  ip6tables -t mangle -A SINGBOX -p udp -j TPROXY --on-port 60080 --tproxy-mark 1
-  ip6tables -t mangle -A PREROUTING -p tcp -j SINGBOX
-  ip6tables -t mangle -A PREROUTING -p udp -j SINGBOX
-fi
-
-# ip rule + route，确保 mark=1 的流量回到本机（透明代理）
-
-# 先删旧的，忽略错误
-ip rule del fwmark 1 lookup 100 2>/dev/null || true
-ip -6 rule del fwmark 1 lookup 100 2>/dev/null || true
-ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
-
-# 再加新的，忽略 "File exists" 等错误
-ip rule add fwmark 1 lookup 100 2>/dev/null || true
-ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
-
-# IPv6 路由是可选的，系统没开 IPv6 也无所谓
-ip -6 rule add fwmark 1 lookup 100 2>/dev/null || true
-ip -6 route add local ::/0 dev lo table 100 2>/dev/null || true
-
-echo "TProxy 防火墙规则已应用。"
+while read ip; do
+  [[ $ip =~ ^# ]] && continue
+  [[ -z $ip ]] && continue
+  ip route add $ip dev warp >/dev/null 2>&1
+done < $IP_LIST
 EOF
 
-chmod +x "$TPROXY_SCRIPT"
-
-########################################
-# 7. systemd 服务：TProxy + sing-box
-########################################
-
-TPROXY_SERVICE="/etc/systemd/system/singbox-tproxy.service"
-
-cat > "$TPROXY_SERVICE" <<EOF
-[Unit]
-Description=sing-box TProxy 防火墙规则
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$TPROXY_SCRIPT
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
+    # 写入删除路由脚本
+    cat > /etc/wireguard/del_google_routes.sh << 'EOF'
+#!/bin/bash
+IP_LIST="/etc/wireguard/google_ips.txt"
+[ ! -f "$IP_LIST" ] && exit 0
+while read ip; do
+  [[ $ip =~ ^# ]] && continue
+  [[ -z $ip ]] && continue
+  ip route del $ip dev warp >/dev/null 2>&1
+done < $IP_LIST
 EOF
 
-systemctl daemon-reload
+    chmod +x /etc/wireguard/*.sh
 
-echo "[*] 启用并启动 sing-box 与 TProxy 服务..."
+    echo -e "${YELLOW}>>> [5/5] 启动服务...${NC}"
+    # 放行 UFW 防火墙
+    if command -v ufw >/dev/null; then
+        ufw allow out 51820/udp >/dev/null 2>&1
+    fi
 
-# 使用安装包自带的 sing-box.service（Debian .deb 安装会提供）
-if systemctl list-unit-files | grep -q '^sing-box.service'; then
-  systemctl enable --now sing-box.service
-else
-  # 兜底：如果没有自带 service，则创建一个简单的
-  cat > /etc/systemd/system/sing-box.service <<EOT
-[Unit]
-Description=sing-box proxy service
-After=network-online.target
-Wants=network-online.target
+    wg-quick down warp >/dev/null 2>&1
+    systemctl enable wg-quick@warp >/dev/null 2>&1
+    systemctl restart wg-quick@warp
 
-[Service]
-ExecStart=$(command -v sing-box) run -c $CONFIG_PATH
-Restart=on-failure
-RestartSec=5
+    echo -e "${GREEN}>>> ✅ 安装完成！${NC}"
+    check_status
+}
 
-[Install]
-WantedBy=multi-user.target
-EOT
-  systemctl daemon-reload
-  systemctl enable --now sing-box.service
-fi
+# ===================================================
+# 2. 卸载逻辑
+# ===================================================
+uninstall_warp() {
+    echo -e "${YELLOW}>>> 正在卸载...${NC}"
+    systemctl stop wg-quick@warp >/dev/null 2>&1
+    systemctl disable wg-quick@warp >/dev/null 2>&1
+    
+    # 执行清理路由
+    if [ -f /etc/wireguard/del_google_routes.sh ]; then
+        bash /etc/wireguard/del_google_routes.sh >/dev/null 2>&1
+    fi
 
-systemctl enable --now singbox-tproxy.service
+    rm -rf /etc/wireguard/warp.conf
+    rm -rf /etc/wireguard/add_google_routes.sh
+    rm -rf /etc/wireguard/del_google_routes.sh
+    rm -rf /etc/wireguard/google_ips.txt
+    
+    echo -e "${GREEN}>>> 卸载完成，已恢复直连。${NC}"
+}
 
-echo "=== 完成！==="
-echo "现在系统默认走 VPS 原始出口，所有 Google / YouTube / Gemini 等域名走 WARP。"
-echo "测试示例："
-echo "  curl https://www.google.com  # IP 应该是 Cloudflare / WARP 段"
-echo "  curl https://ifconfig.me     # IP 应该还是你的 VPS 原 IP"
+# ===================================================
+# 3. 状态检查 (集成防火墙检测)
+# ===================================================
+check_status() {
+    echo -e "${SKYBLUE}>>> 状态检测...${NC}"
+    
+    if ! systemctl is-active --quiet wg-quick@warp; then
+        echo -e "服务状态: ${RED}未运行${NC}"
+        return
+    fi
+
+    # 握手检测 (防火墙检测核心)
+    LATEST_HANDSHAKE=$(wg show warp latest-handshakes | awk '{print $2}')
+    if [ -z "$LATEST_HANDSHAKE" ] || [ "$LATEST_HANDSHAKE" = "0" ]; then
+        echo -e "${RED}⚠️  警告：握手失败 (Handshake = 0)${NC}"
+        echo -e "${YELLOW}请检查云厂商防火墙(安全组)，确保允许 UDP 出站 (Outbound)。${NC}"
+        return
+    fi
+
+    # 路由检测
+    ROUTE_COUNT=$(ip route | grep warp | wc -l)
+    echo -e "Google 路由规则: ${GREEN}${ROUTE_COUNT} 条${NC}"
+
+    # 联网测试 (-4 强制 IPv4, --max-time 避免卡死)
+    RESULT=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
+    if [ "$RESULT" == "200" ] || [ "$RESULT" == "301" ] || [ "$RESULT" == "302" ]; then
+        echo -e "Gemini 访问: ${GREEN}解锁成功 (Code: $RESULT)${NC}"
+    else
+        echo -e "Gemini 访问: ${RED}失败 (Code: $RESULT)${NC}"
+    fi
+}
+
+# ===================================================
+# 4. 菜单入口
+# ===================================================
+clear
+echo -e "${GREEN}=============================================${NC}"
+echo -e "${GREEN}   WARP Google Unlocker (System Routing)     ${NC}"
+echo -e "${GREEN}=============================================${NC}"
+echo -e "1. 安装 / 修复 (Install/Repair)"
+echo -e "2. 卸载 (Uninstall)"
+echo -e "3. 检测状态 (Check Status)"
+echo -e "0. 退出 (Exit)"
+echo -e "---------------------------------------------"
+read -p "选择: " choice
+
+case $choice in
+    1) install_warp ;;
+    2) uninstall_warp ;;
+    3) check_status ;;
+    0) exit 0 ;;
+    *) echo "无效选项" ;;
+esac
