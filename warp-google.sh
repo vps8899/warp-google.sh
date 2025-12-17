@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
 # Project: WARP Google Unlock (RackNerd/IPv4 Fix)
-# Version: 4.2 (Anti-Duplicate Address Logic)
+# Version: 4.3 (Force IPv4 Endpoint)
 # ===================================================
 
 RED='\033[0;31m'
@@ -60,15 +60,17 @@ install_warp() {
     fi
     /usr/local/bin/wgcf generate >/dev/null 2>&1
 
-    echo -e "${YELLOW}>>> [3/5] 优化配置 (防重复/去IPv6)...${NC}"
+    echo -e "${YELLOW}>>> [3/5] 优化配置 (强制 IPv4)...${NC}"
     CONF_PATH="/etc/wireguard/warp.conf"
     cp wgcf-profile.conf $CONF_PATH
 
-    # --- 核心修复：彻底防止重复 Address (v4.2) ---
-    # 逻辑：先删除所有 Address 行，再手动添加一行。
-    # 这样无论原文件格式如何，永远只保留一条正确的配置。
+    # --- 核心修复 v4.2: 防止重复 Address ---
     sed -i '/^Address/d' $CONF_PATH
     sed -i '/^PrivateKey/a Address = 172.16.0.2/32' $CONF_PATH
+
+    # --- 核心修复 v4.3: 强制 IPv4 Endpoint ---
+    # 解决 DNS 解析到 IPv6 导致握手失败的问题
+    sed -i 's/Endpoint.*/Endpoint = 162.159.192.1:2408/' $CONF_PATH
 
     # --- 基础配置修改 ---
     sed -i '/DNS/d' $CONF_PATH
@@ -153,6 +155,8 @@ check_status() {
     LATEST_HANDSHAKE=$(wg show warp latest-handshakes | awk '{print $2}')
     if [ -z "$LATEST_HANDSHAKE" ] || [ "$LATEST_HANDSHAKE" = "0" ]; then
         echo -e "${RED}⚠️  警告：握手失败 (Handshake = 0)${NC}"
+        echo -e "${YELLOW}可能原因：Endpoint 解析到了 IPv6 (RackNerd不支持)。${NC}"
+        echo -e "${YELLOW}尝试修复：请更新脚本到 v4.3 版本强制使用 IPv4 Endpoint。${NC}"
         return
     fi
 
