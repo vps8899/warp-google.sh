@@ -45,6 +45,10 @@ install_warp() {
     
     case $OS in
         ubuntu|debian)
+            # 先安装必要依赖
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y gnupg curl wget lsb-release >/dev/null 2>&1
+            
             # 添加 Cloudflare GPG 密钥
             curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
             
