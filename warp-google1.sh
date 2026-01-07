@@ -121,6 +121,18 @@ configure_warp() {
 setup_transparent_proxy() {
     echo -e "\n${CYAN}[3/3] 配置透明代理规则...${NC}"
     
+    # 禁用 IPv6 访问 Google（避免 IPv4/IPv6 不匹配导致被检测）
+    echo -e "配置 IPv6 规则..."
+    
+    # 方法1: 添加 IPv6 黑洞路由到 Google IPv6 地址
+    # Google IPv6 范围: 2607:f8b0::/32
+    ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
+    
+    # 方法2: 设置系统优先使用 IPv4
+    if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
+        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+    fi
+    
     # 安装 redsocks (透明代理工具)
     case $OS in
         ubuntu|debian)
