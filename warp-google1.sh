@@ -9,12 +9,16 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-echo -e "${CYAN}"
-echo "╔════════════════════════════════════════════════════╗"
-echo "║     🌐 WARP 一键脚本 - Google 自动解锁 🌐           ║"
-echo "║         使用 Cloudflare 官方客户端                  ║"
-echo "╚════════════════════════════════════════════════════╝"
-echo -e "${NC}"
+# 显示横幅
+show_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "╔════════════════════════════════════════════════════╗"
+    echo "║     🌐 WARP 一键脚本 - Google 自动解锁 🌐           ║"
+    echo "║         使用 Cloudflare 官方客户端                  ║"
+    echo "╚════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
 
 # 检查 root
 [[ $EUID -ne 0 ]] && { echo -e "${RED}请使用 root 运行！${NC}"; exit 1; }
@@ -361,8 +365,8 @@ EOF
     chmod +x /usr/local/bin/warp
 }
 
-# 主流程
-main() {
+# 安装主流程
+do_install() {
     install_warp
     configure_warp
     setup_transparent_proxy
@@ -375,6 +379,164 @@ main() {
     echo -e "\n${YELLOW}所有 Google 流量现已自动通过 WARP！${NC}"
     echo -e "${YELLOW}无需任何额外配置，直接访问即可。${NC}"
     echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|test|ip|uninstall}${NC}\n"
+}
+
+# 卸载
+do_uninstall() {
+    echo -e "\n${YELLOW}正在卸载 WARP...${NC}"
+    /usr/local/bin/warp-google stop 2>/dev/null
+    warp-cli disconnect 2>/dev/null
+    systemctl disable warp-google 2>/dev/null
+    systemctl stop warp-svc 2>/dev/null
+    rm -f /etc/systemd/system/warp-google.service
+    rm -f /usr/local/bin/warp-google
+    rm -f /usr/local/bin/warp
+    rm -f /etc/redsocks.conf
+    
+    # 清理 iptables 规则
+    iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
+    iptables -t nat -F WARP_GOOGLE 2>/dev/null
+    iptables -t nat -X WARP_GOOGLE 2>/dev/null
+    
+    # 删除 IPv6 黑洞路由
+    ip -6 route del blackhole 2607:f8b0::/32 2>/dev/null
+    
+    # 卸载软件包
+    case $OS in
+        ubuntu|debian)
+            apt-get remove -y cloudflare-warp redsocks 2>/dev/null
+            rm -f /etc/apt/sources.list.d/cloudflare-client.list
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            yum remove -y cloudflare-warp redsocks 2>/dev/null || dnf remove -y cloudflare-warp redsocks 2>/dev/null
+            rm -f /etc/yum.repos.d/cloudflare-warp.repo
+            ;;
+    esac
+    
+    echo -e "${GREEN}✓ WARP 已完全卸载${NC}\n"
+}
+
+# 查看状态
+do_status() {
+    echo -e "\n${CYAN}══════════════ WARP 运行状态 ══════════════${NC}\n"
+    
+    # WARP 客户端状态
+    echo -e "${YELLOW}【WARP 客户端】${NC}"
+    if command -v warp-cli &>/dev/null; then
+        warp-cli status 2>/dev/null || echo "未运行"
+    else
+        echo -e "${RED}未安装${NC}"
+    fi
+    
+    echo ""
+    
+    # Redsocks 状态
+    echo -e "${YELLOW}【透明代理】${NC}"
+    if pgrep -x redsocks >/dev/null; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}未运行${NC}"
+    fi
+    
+    echo ""
+    
+    # iptables 规则
+    echo -e "${YELLOW}【iptables 规则】${NC}"
+    iptables -t nat -L WARP_GOOGLE -n 2>/dev/null | head -3 || echo -e "${RED}无规则${NC}"
+    
+    echo -e "\n${CYAN}════════════════════════════════════════════${NC}\n"
+}
+
+# 查看 IP
+do_show_ip() {
+    echo -e "\n${CYAN}══════════════ IP 信息 ══════════════${NC}\n"
+    
+    echo -e "${YELLOW}【直连 IP】${NC}"
+    DIRECT_IP=$(curl -4 -s --max-time 5 ip.sb)
+    DIRECT_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$DIRECT_IP?lang=zh-CN" 2>/dev/null)
+    echo -e "IP: ${GREEN}$DIRECT_IP${NC}"
+    echo -e "位置: $(echo $DIRECT_INFO | grep -oP '"country":"\K[^"]+') - $(echo $DIRECT_INFO | grep -oP '"city":"\K[^"]+')\n"
+    
+    echo -e "${YELLOW}【WARP IP】${NC}"
+    WARP_IP=$(curl -x socks5://127.0.0.1:40000 -s --max-time 5 ip.sb 2>/dev/null)
+    if [ -n "$WARP_IP" ]; then
+        WARP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$WARP_IP?lang=zh-CN" 2>/dev/null)
+        echo -e "IP: ${GREEN}$WARP_IP${NC}"
+        echo -e "位置: $(echo $WARP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $WARP_INFO | grep -oP '"city":"\K[^"]+')\n"
+    else
+        echo -e "${RED}无法获取 (WARP 可能未运行)${NC}\n"
+    fi
+    
+    echo -e "${CYAN}══════════════════════════════════════${NC}\n"
+}
+
+# 测试 Google 连接
+do_test_google() {
+    echo -e "\n${CYAN}测试 Google 连接...${NC}"
+    RESULT=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
+    if [ "$RESULT" = "200" ]; then
+        echo -e "${GREEN}✓ Google 连接成功！状态码: $RESULT${NC}\n"
+    else
+        echo -e "${RED}✗ Google 连接失败，状态码: $RESULT${NC}\n"
+    fi
+}
+
+# 启动服务
+do_start() {
+    echo -e "\n${CYAN}启动 WARP 服务...${NC}"
+    warp-cli connect 2>/dev/null
+    /usr/local/bin/warp-google start 2>/dev/null
+    echo -e "${GREEN}✓ WARP 已启动${NC}\n"
+}
+
+# 停止服务
+do_stop() {
+    echo -e "\n${CYAN}停止 WARP 服务...${NC}"
+    /usr/local/bin/warp-google stop 2>/dev/null
+    warp-cli disconnect 2>/dev/null
+    echo -e "${GREEN}✓ WARP 已停止${NC}\n"
+}
+
+# 显示菜单
+show_menu() {
+    echo -e "${YELLOW}请选择操作:${NC}\n"
+    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Gemini和商店等)"
+    echo -e "  ${GREEN}2.${NC} 卸载 WARP"
+    echo -e "  ${GREEN}3.${NC} 查看状态"
+    echo -e "  ${GREEN}0.${NC} 退出\n"
+    
+    read -p "请输入选项 [0-3]: " choice
+    
+    case $choice in
+        1) do_install ;;
+        2) do_uninstall ;;
+        3) do_status; do_show_ip; do_test_google ;;
+        0) echo -e "\n${GREEN}再见！${NC}\n"; exit 0 ;;
+        *) echo -e "\n${RED}无效选项${NC}\n" ;;
+    esac
+}
+
+# 主入口
+main() {
+    show_banner
+    
+    # 检查 root
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}请使用 root 运行！${NC}"; exit 1; }
+    
+    # 检测系统
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VERSION=$VERSION_ID
+        CODENAME=$VERSION_CODENAME
+    else
+        echo -e "${RED}无法检测系统${NC}"; exit 1
+    fi
+    
+    ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+    echo -e "${GREEN}系统: $OS $VERSION ($CODENAME) $ARCH${NC}\n"
+    
+    show_menu
 }
 
 main
