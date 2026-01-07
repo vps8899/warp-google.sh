@@ -68,7 +68,8 @@ install_core() {
         FINAL_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
         DNS_STR="8.8.8.8, 1.1.1.1"
         ALLOWED_IPS="0.0.0.0/0"
-        ENDPOINT_HOST="162.159.192.1:2408" # 强制 IP，防止 DNS 解析到 v6
+        # 关键修改：RackNerd 必须用纯 IPv4 IP，防止解析到 IPv6
+        ENDPOINT_HOST="162.159.192.1:2408" 
     fi
 
     cat > /etc/wireguard/warp.conf <<WG_CONF
@@ -104,7 +105,8 @@ WG_CONF
     if systemctl start wg-quick@warp; then
         echo -e "${GREEN}>>> 启动成功！${NC}"
     else
-        echo -e "${RED}>>> 启动失败！建议尝试 [强制 IPv4] 模式。${NC}"
+        echo -e "${RED}>>> 启动失败！${NC}"
+        echo -e "${YELLOW}如果是 RackNerd 机器，请务必选择菜单中的 [强制 IPv4] 选项！${NC}"
         echo -e "查看日志: journalctl -xeu wg-quick@warp"
         exit 1
     fi
