@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Project: WARP Unlocker (Smart Fallback v8.1)
-# Version: 8.1 (Auto-Downgrade if IPv6 Fails)
+# Project: WARP Unlocker (Manual Mode v9.0)
+# Version: 9.0 (Menu Selector: Dual Stack vs IPv4 Only)
 # ===================================================
 
 RED='\033[0;31m'
@@ -14,23 +14,17 @@ NC='\033[0m'
 # 核心安装逻辑
 # ===================================================
 install_core() {
-    MODE=$1 
+    # 参数1: 分流模式 (google/youtube/media)
+    # 参数2: 网络栈模式 (auto/ipv4)
+    ROUTING_MODE=$1 
+    NET_STACK=$2
 
-    echo -e "${YELLOW}>>> [1/7] 初始化与环境检测...${NC}"
+    echo -e "${YELLOW}>>> [1/7] 环境初始化...${NC}"
     check_root
     check_tun
     install_deps
     
-    # 1. 初步检测 IPv6 (RackNerd 可能会在这里骗过检测)
-    HAS_IPV6=false
-    if ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
-        HAS_IPV6=true
-        echo -e "环境检测: ${GREEN}双栈网络 (IPv4 + IPv6)${NC}"
-    else
-        echo -e "环境检测: ${YELLOW}单栈网络 (仅 IPv4)${NC}"
-    fi
-
-    # 清理旧环境
+    # 强制清理旧环境 (防止残留导致启动失败)
     systemctl stop wg-quick@warp >/dev/null 2>&1
     systemctl disable wg-quick@warp >/dev/null 2>&1
     ip link delete dev warp >/dev/null 2>&1
@@ -38,82 +32,50 @@ install_core() {
     rm -rf /etc/wireguard/routes.txt
     rm -rf /etc/wireguard/routes6.txt
 
-    echo -e "${YELLOW}>>> [2/7] 获取 WARP 账户与密钥...${NC}"
+    # 决定是否启用 IPv6
+    ENABLE_IPV6=false
+    if [ "$NET_STACK" == "auto" ]; then
+        # 自动检测：尝试 Ping Google IPv6 DNS
+        if ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+            ENABLE_IPV6=true
+            echo -e "网络模式: ${GREEN}双栈 (自动检测到 IPv6)${NC}"
+        else
+            echo -e "网络模式: ${YELLOW}单栈 (仅 IPv4)${NC}"
+        fi
+    else
+        # 强制 IPv4 模式 (RackNerd 救星)
+        echo -e "网络模式: ${SKYBLUE}强制 IPv4 (忽略系统 IPv6)${NC}"
+    fi
+
+    echo -e "${YELLOW}>>> [2/7] 获取 WARP 密钥...${NC}"
     get_warp_profile
 
-    echo -e "${YELLOW}>>> [3/7] 生成初始配置...${NC}"
+    echo -e "${YELLOW}>>> [3/7] 生成配置文件...${NC}"
     
     PRIVATE_KEY=$(grep 'PrivateKey' wgcf-profile.conf | cut -d' ' -f3)
     ORIG_ADDR=$(grep 'Address' wgcf-profile.conf | cut -d'=' -f2 | tr -d ' ')
     
-    # 根据检测结果决定初始 Address
-    if [ "$HAS_IPV6" = true ]; then
+    # 根据模式生成配置
+    if [ "$ENABLE_IPV6" = true ]; then
+        # 双栈配置
         FINAL_ADDR="$ORIG_ADDR"
         DNS_STR="8.8.8.8, 1.1.1.1, 2001:4860:4860::8888"
         ALLOWED_IPS="0.0.0.0/0, ::/0"
+        ENDPOINT_HOST="engage.cloudflareclient.com:2408" # 双栈可用域名
     else
+        # 强制 IPv4 配置
+        # 1. 截取 IPv4 地址
         FINAL_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
         DNS_STR="8.8.8.8, 1.1.1.1"
         ALLOWED_IPS="0.0.0.0/0"
+        ENDPOINT_HOST="162.159.192.1:2408" # 强制 IP，防止 DNS 解析到 v6
     fi
 
-    write_conf "$PRIVATE_KEY" "$FINAL_ADDR" "$DNS_STR" "$ALLOWED_IPS"
-
-    echo -e "${YELLOW}>>> [4/7] 下载分流规则 (模式: $MODE)...${NC}"
-    generate_routes "$MODE" "$HAS_IPV6"
-
-    echo -e "${YELLOW}>>> [5/7] 首次启动服务...${NC}"
-    # 开启转发
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/warp.conf
-    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/warp.conf
-    sysctl -p /etc/sysctl.d/warp.conf >/dev/null 2>&1
-
-    systemctl enable wg-quick@warp >/dev/null 2>&1
-    if systemctl start wg-quick@warp; then
-        echo -e "${GREEN}>>> 启动成功！${NC}"
-        FINAL_IPV6_STATUS=$HAS_IPV6
-    else
-        # === 核心修复逻辑：自动降级 ===
-        echo -e "${RED}>>> 启动失败！检测到可能的 IPv6 兼容性问题 (RackNerd Trap)。${NC}"
-        echo -e "${YELLOW}>>> 正在触发自动降级机制：强制切换为纯 IPv4 模式重试...${NC}"
-        
-        # 1. 强制只取 IPv4 地址
-        IPV4_ONLY_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
-        # 2. 重写配置文件
-        write_conf "$PRIVATE_KEY" "$IPV4_ONLY_ADDR" "8.8.8.8, 1.1.1.1" "0.0.0.0/0"
-        # 3. 重新生成路由 (强制 disable IPv6)
-        generate_routes "$MODE" "false"
-        
-        # 4. 重试启动
-        if systemctl restart wg-quick@warp; then
-            echo -e "${GREEN}>>> 降级重试成功！已切换为纯 IPv4 模式。${NC}"
-            FINAL_IPV6_STATUS="false"
-        else
-            echo -e "${RED}>>> 严重错误：纯 IPv4 模式也无法启动。请检查系统日志。${NC}"
-            exit 1
-        fi
-    fi
-
-    echo -e "${YELLOW}>>> [6/7] 最终验证...${NC}"
-    sleep 3
-    check_status "$FINAL_IPV6_STATUS"
-}
-
-# ===================================================
-# 辅助函数模块
-# ===================================================
-
-write_conf() {
-    local key=$1
-    local addr=$2
-    local dns=$3
-    local allowed=$4
-    
     cat > /etc/wireguard/warp.conf <<WG_CONF
 [Interface]
-PrivateKey = $key
-Address = $addr
-DNS = $dns
+PrivateKey = $PRIVATE_KEY
+Address = $FINAL_ADDR
+DNS = $DNS_STR
 MTU = 1280
 Table = off
 PostUp = bash /etc/wireguard/add_routes.sh
@@ -121,11 +83,40 @@ PreDown = bash /etc/wireguard/del_routes.sh
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = $allowed
-Endpoint = 162.159.192.1:2408
+AllowedIPs = $ALLOWED_IPS
+Endpoint = $ENDPOINT_HOST
 PersistentKeepalive = 25
 WG_CONF
+
+    echo -e "${YELLOW}>>> [4/7] 下载分流规则...${NC}"
+    generate_routes "$ROUTING_MODE" "$ENABLE_IPV6"
+
+    echo -e "${YELLOW}>>> [5/7] 启动服务...${NC}"
+    # 开启转发
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/warp.conf
+    if [ "$ENABLE_IPV6" = true ]; then
+        echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/warp.conf
+    fi
+    sysctl -p /etc/sysctl.d/warp.conf >/dev/null 2>&1
+
+    systemctl enable wg-quick@warp >/dev/null 2>&1
+    
+    if systemctl start wg-quick@warp; then
+        echo -e "${GREEN}>>> 启动成功！${NC}"
+    else
+        echo -e "${RED}>>> 启动失败！建议尝试 [强制 IPv4] 模式。${NC}"
+        echo -e "查看日志: journalctl -xeu wg-quick@warp"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}>>> [6/7] 验证连接...${NC}"
+    sleep 3
+    check_status "$ENABLE_IPV6"
 }
+
+# ===================================================
+# 辅助函数
+# ===================================================
 
 check_root() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行！${NC}" && exit 1
@@ -169,15 +160,14 @@ get_warp_profile() {
     /usr/local/bin/wgcf generate >/dev/null 2>&1
     
     if [ ! -f wgcf-profile.conf ]; then
-        echo -e "${RED}❌ WARP 配置文件生成失败，请检查网络连接${NC}"
+        echo -e "${RED}❌ WARP 配置文件生成失败${NC}"
         exit 1
     fi
-    cp wgcf-profile.conf profile_backup.conf
 }
 
 generate_routes() {
     MODE=$1
-    IPV6_ENABLED=$2
+    IPV6=$2
     
     cat > /etc/wireguard/add_routes.sh <<EOF
 #!/bin/bash
@@ -185,6 +175,7 @@ IP_FILE="/etc/wireguard/routes.txt"
 IP6_FILE="/etc/wireguard/routes6.txt"
 rm -f \$IP_FILE \$IP6_FILE
 
+# IPv4 规则
 wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google_IP-CIDR.txt >> \$IP_FILE
 
 if [ "$MODE" == "youtube" ] || [ "$MODE" == "media" ]; then
@@ -206,7 +197,8 @@ while read ip; do
   ip route add \$clean_ip dev warp >/dev/null 2>&1
 done < \$IP_FILE
 
-if [ "$IPV6_ENABLED" = true ]; then
+# IPv6 规则 (仅当启用时)
+if [ "$IPV6" = true ]; then
     echo "2001:4860::/32" > \$IP6_FILE
     echo "2404:6800::/32" >> \$IP6_FILE
     while read ip; do
@@ -256,7 +248,7 @@ uninstall_warp() {
 }
 
 check_status() {
-    HAS_IPV6=$1
+    IPV6=$1
     if ! systemctl is-active --quiet wg-quick@warp; then
         echo -e "服务状态: ${RED}未运行${NC}"
         return
@@ -267,24 +259,15 @@ check_status() {
         echo -e "${RED}⚠️  握手失败 (Handshake=0)${NC}"
         return
     else
-        echo -e "WARP 握手: ${GREEN}正常 (Mode: $([ "$HAS_IPV6" = true ] && echo "IPv4+IPv6" || echo "IPv4-Only"))${NC}"
+        echo -e "WARP 握手: ${GREEN}正常${NC}"
     fi
 
-    echo -e "--- 分流效果测试 ---"
+    echo -e "--- 分流测试 ---"
     G4_CODE=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
     if [[ "$G4_CODE" =~ ^(200|301|302)$ ]]; then
-        echo -e "Gemini (IPv4): ${GREEN}✅ 已解锁${NC}"
+        echo -e "Gemini (IPv4): ${GREEN}✅ 解锁成功${NC}"
     else
         echo -e "Gemini (IPv4): ${RED}❌ 失败 ($G4_CODE)${NC}"
-    fi
-
-    if [ "$HAS_IPV6" = true ]; then
-        G6_CODE=$(curl -sI -6 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
-        if [[ "$G6_CODE" =~ ^(200|301|302)$ ]]; then
-            echo -e "Gemini (IPv6): ${GREEN}✅ 已解锁${NC}"
-        else
-            echo -e "Gemini (IPv6): ${RED}❌ 失败 (IPv6不可用)${NC}"
-        fi
     fi
 }
 
@@ -293,26 +276,31 @@ check_status() {
 # ===================================================
 clear
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}   WARP Unlocker (Smart Fallback v8.1)       ${NC}"
+echo -e "${GREEN}   WARP Unlocker (Stable v9.0)               ${NC}"
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}自动检测双栈 -> 失败自动降级 IPv4${NC}"
 echo -e "---------------------------------------------"
-echo -e "1. 解锁 Google基础 (Gemini/搜索) - ${SKYBLUE}YouTube 直连(无广告)${NC}"
-echo -e "2. 解锁 Google全家桶 (含 YouTube) - ${SKYBLUE}YouTube 走 WARP${NC}"
-echo -e "3. 解锁 媒体全家桶 (含 YouTube/Netflix)"
+echo -e "  [模式 A]: 自动检测双栈 (普通 VPS 推荐)"
+echo -e "  [模式 B]: 强制 IPv4 (RackNerd/Buggy IPv6 推荐)"
 echo -e "---------------------------------------------"
-echo -e "4. 卸载 (Uninstall)"
-echo -e "5. 检测状态 (Check Status)"
+echo -e "1. Google基础 (无广告YouTube) - ${YELLOW}自动检测${NC}"
+echo -e "2. Google基础 (无广告YouTube) - ${SKYBLUE}强制 IPv4${NC} (RN选这个!)"
+echo -e "---------------------------------------------"
+echo -e "3. Google全家桶 (全走代理)    - ${YELLOW}自动检测${NC}"
+echo -e "4. Google全家桶 (全走代理)    - ${SKYBLUE}强制 IPv4${NC}"
+echo -e "---------------------------------------------"
+echo -e "5. 卸载 (Uninstall)"
+echo -e "6. 检测状态 (Check Status)"
 echo -e "0. 退出"
 echo -e "---------------------------------------------"
-read -p "请选择 [0-5]: " choice
+read -p "请选择 [0-6]: " choice
 
 case $choice in
-    1) install_core "google" ;;
-    2) install_core "youtube" ;;
-    3) install_core "media" ;;
-    4) uninstall_warp ;;
-    5) check_status "false" ;; 
+    1) install_core "google" "auto" ;;
+    2) install_core "google" "ipv4" ;; # 这里就是你要的“只允许IPv4出站”
+    3) install_core "youtube" "auto" ;;
+    4) install_core "youtube" "ipv4" ;;
+    5) uninstall_warp ;;
+    6) check_status "false" ;; 
     0) exit 0 ;;
     *) echo "无效选择" ;;
 esac
